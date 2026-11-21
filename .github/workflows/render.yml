@@ -1,0 +1,136 @@
+name: Render Motion Video
+
+# Dijalankan secara manual dari tab Actions > Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      composition:
+        description: 'Ketik manual ID komposisi, contoh: Q01-Burung (ID tersedia: Q01-Burung, Q02-Hati, Q03-Bintang, Q04-Ikan, Q05-Kupu)'
+        required: true
+        type: string
+        default: 'Q01-Burung'
+      mode:
+        description: 'preview = 1280x720 (cepat untuk cek) | final-4k = 3840x2160 (hasil akhir)'
+        required: true
+        type: choice
+        default: preview
+        options:
+          - preview
+          - final-4k
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    name: Render ${{ inputs.composition }} (${{ inputs.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      # Input dikirim lewat environment, bukan langsung di script, agar aman dari injeksi perintah
+      COMP_INPUT: ${{ inputs.composition }}
+      MODE: ${{ inputs.mode }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validasi ID komposisi
+        id: validate
+        run: |
+          set -e
+          INPUT="$(printf '%s' "$COMP_INPUT" | tr -d '[:space:]')"
+          if [ -z "$INPUT" ]; then
+            echo "::error title=Input kosong::Kolom composition belum diisi. Ketik ID seperti Q01-Burung."
+            exit 1
+          fi
+
+          # Ambil daftar ID langsung dari src/Root.jsx, jadi tidak perlu diubah manual
+          VALID_IDS="$(grep -oE "id: '[A-Za-z0-9-]+'" src/Root.jsx | sed -E "s/id: '([^']+)'/\1/")"
+          MATCH="$(printf '%s\n' "$VALID_IDS" | grep -ixF -- "$INPUT" || true)"
+
+          if [ -z "$MATCH" ]; then
+            LIST="$(printf '%s' "$VALID_IDS" | tr '\n' ' ')"
+            echo "::error title=ID komposisi tidak dikenal::'$INPUT' tidak ada di src/Root.jsx. ID yang tersedia: $LIST"
+            exit 1
+          fi
+
+          echo "id=$MATCH" >> "$GITHUB_OUTPUT"
+          echo "Komposisi terpilih: $MATCH"
+
+      - name: Install dependencies
+        run: |
+          set -e
+          npm install --no-audit --no-fund || {
+            echo "::error title=Instalasi gagal::npm install gagal. Periksa file package.json dan koneksi jaringan runner, lalu jalankan ulang workflow."
+            exit 1
+          }
+
+      - name: Tentukan resolusi
+        id: res
+        run: |
+          set -e
+          if [ "$MODE" = "preview" ]; then
+            echo "width=1280" >> "$GITHUB_OUTPUT"
+            echo "height=720" >> "$GITHUB_OUTPUT"
+            echo "crf=28" >> "$GITHUB_OUTPUT"
+            echo "vb=" >> "$GITHUB_OUTPUT"
+          else
+            echo "width=3840" >> "$GITHUB_OUTPUT"
+            echo "height=2160" >> "$GITHUB_OUTPUT"
+            echo "crf=18" >> "$GITHUB_OUTPUT"
+            # Bitrate target untuk 4K agar detail gradasi tidak pecah (CRF saja menghasilkan bitrate rendah pada latar datar)
+            echo "vb=16M" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cek entry point dan ID
+        env:
+          COMP_ID: ${{ steps.validate.outputs.id }}
+        run: |
+          set -e
+          echo "ID yang dipakai: [$COMP_ID]"
+          if [ ! -f src/index.jsx ]; then
+            echo "::error title=File tidak ditemukan::src/index.jsx tidak ada di root repo. Pastikan folder src dan package.json berada langsung di root, bukan di dalam folder lain."
+            exit 1
+          fi
+          if [ ! -f package.json ]; then
+            echo "::error title=package.json tidak ditemukan::Pastikan package.json berada di root repo."
+            exit 1
+          fi
+          test -n "$COMP_ID" || { echo "::error::ID kosong"; exit 1; }
+
+      - name: Render video ke MP4 (H.264, 30 FPS)
+        env:
+          COMP_ID: ${{ steps.validate.outputs.id }}
+          WIDTH: ${{ steps.res.outputs.width }}
+          HEIGHT: ${{ steps.res.outputs.height }}
+          CRF: ${{ steps.res.outputs.crf }}
+          VB: ${{ steps.res.outputs.vb }}
+        run: |
+          set -e
+          mkdir -p out
+          OUTFILE="out/${COMP_ID}_${MODE}.mp4"
+          npx remotion render src/index.jsx "$COMP_ID" "$OUTFILE" \
+            --codec=h264 \
+            --fps=30 \
+            --width="$WIDTH" \
+            --height="$HEIGHT" \
+            $( [ -n "$VB" ] && echo "--video-bitrate=$VB" || echo "--crf=$CRF" ) \
+            --log=info || {
+              echo "::error title=Render gagal::Render $COMP_ID gagal. Coba mode preview terlebih dahulu. Jika error memuat 'browser' atau 'chrome', jalankan ulang workflow; jika error memuat 'composition', pastikan ID cocok dengan src/Root.jsx."
+              exit 1
+            }
+          ls -lh out/
+
+      - name: Upload hasil MP4 sebagai Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.validate.outputs.id }}-${{ inputs.mode }}
+          path: out/*.mp4
+          retention-days: 14
+          if-no-files-found: error
